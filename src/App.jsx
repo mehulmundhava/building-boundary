@@ -10,11 +10,12 @@ const MAPTILER_STYLE_URL = `https://api.maptiler.com/maps/streets-v2/style.json?
 const QUERY_RADIUS_PX = 3
 const FLY_TO_ZOOM = 17.5
 const DISCOVERY_ZOOM = 13.5            // lower zoom for Phase 1 — broad tile coverage to discover full building extent
-const SOURCE_QUERY_DELAY_MS = 150
+const SOURCE_QUERY_DELAY_MS = 75
 
 // ── Area-Guard & Distance-Guard thresholds (defaults, can be overridden per-call) ──
 const AREA_MULTIPLIER = 3.0           // max cluster area = seed area × this
 const MAX_NEIGHBOR_DISTANCE_KM = 0.05 // 50 m — reject polygons farther than this from seed centroid
+const MAX_BUILDING_AREA_SQM = 350_000 // 350K m² — anything larger is landuse/zone, not a building
 
 // Ray-casting: is point [lng, lat] inside polygon ring (array of [lng, lat])?
 function pointInRing(point, ring) {
@@ -138,6 +139,7 @@ function pickOrMergeSourceFeatures(features, lngLat, options = {}) {
     try {
       if (turf.booleanPointInPolygon(clickPt, poly)) {
         const a = turf.area(poly)
+        if (a > MAX_BUILDING_AREA_SQM) continue  // skip landuse/colonies
         if (a < seedArea) {
           seedArea = a
           seedIndex = i
@@ -333,8 +335,12 @@ function App() {
   const [lat, setLat] = useState('')
   const [lng, setLng] = useState('')
   const [isRunningTests, setIsRunningTests] = useState(false)
+  const [testPaused, setTestPaused] = useState(false)
   const [testProgress, setTestProgress] = useState('')
   const testAbortRef = useRef(false)
+  const testPauseRef = useRef(false)
+  const testIndexRef = useRef(0)
+  const testResumeRef = useRef(null) // holds the resume callback when paused
 
   const clearHighlight = useCallback((map) => {
     if (!map) return
@@ -708,13 +714,18 @@ function App() {
         bestResult = result
 
         // ── Validate: is the click point inside the extracted polygon? ──
-        if (isPointInsideResult(result.geometry)) {
-          console.log(`[Building] ✓ z${zoom} — VALIDATED (point inside polygon)`)
+        const pointOk = isPointInsideResult(result.geometry)
+        let areaOk = true
+        try { areaOk = turf.area(turf.feature(result.geometry)) <= MAX_BUILDING_AREA_SQM } catch (_) { }
+        if (pointOk && areaOk) {
+          console.log(`[Building] ✓ z${zoom} — VALIDATED (point inside + building-sized)`)
           showHighlight(map, result.geometry)
           setGeoJSON(buildGeoJSONFromFeature(result.feature, result.geometry))
           setIsLoadingBuilding(false)
         } else {
-          console.log(`[Building] ✗ z${zoom} — point NOT inside polygon, escalating...`)
+          const reason = !pointOk ? 'point NOT inside' : 'area too large (landuse/zone)'
+          console.log(`[Building] ✗ z${zoom} — ${reason}, escalating...`)
+          if (!areaOk) bestResult = null
           tryNextZoom()
         }
       })
@@ -760,44 +771,56 @@ function App() {
     [42.66067123, -83.46760559],
   ]
 
-  const handleRunAllTests = useCallback(() => {
-    if (isRunningTests) {
-      testAbortRef.current = true
-      setIsRunningTests(false)
-      setTestProgress('')
-      return
-    }
+  const handleStartTests = useCallback(() => {
+    // Always start from beginning
     testAbortRef.current = false
+    testPauseRef.current = false
+    testIndexRef.current = 0
+    testResumeRef.current = null
+    setTestPaused(false)
     setIsRunningTests(true)
-    let idx = 0
 
     const runNext = () => {
-      if (testAbortRef.current || idx >= TEST_COORDINATES.length) {
+      if (testAbortRef.current || testIndexRef.current >= TEST_COORDINATES.length) {
         setIsRunningTests(false)
-        setTestProgress(testAbortRef.current ? 'Aborted' : `Done — ${TEST_COORDINATES.length}/${TEST_COORDINATES.length}`)
+        setTestPaused(false)
+        setTestProgress(
+          testAbortRef.current
+            ? 'Stopped'
+            : `Done — ${TEST_COORDINATES.length}/${TEST_COORDINATES.length}`
+        )
+        testResumeRef.current = null
         return
       }
+
+      // Pause check — store resume callback
+      if (testPauseRef.current) {
+        testResumeRef.current = runNext
+        return
+      }
+
+      const idx = testIndexRef.current
       const [tLat, tLng] = TEST_COORDINATES[idx]
       setTestProgress(`${idx + 1}/${TEST_COORDINATES.length} — (${tLat}, ${tLng})`)
       setLat(String(tLat))
       setLng(String(tLng))
-      idx++
+      testIndexRef.current = idx + 1
 
-      // Wait for React to flush state, then click the real button
       setTimeout(() => {
         const btn = document.getElementById('btn-get-building')
         if (btn) btn.click()
 
-        // Poll until extraction finishes (button becomes enabled again)
         const poll = setInterval(() => {
           if (testAbortRef.current) {
             clearInterval(poll)
+            setIsRunningTests(false)
+            setTestPaused(false)
+            setTestProgress('Stopped')
             return
           }
           const b = document.getElementById('btn-get-building')
           if (b && !b.disabled) {
             clearInterval(poll)
-            // 5 sec viewing delay before next test
             setTimeout(runNext, 5000)
           }
         }, 500)
@@ -805,7 +828,41 @@ function App() {
     }
 
     runNext()
-  }, [isRunningTests])
+  }, [])
+
+  const handlePauseResume = useCallback(() => {
+    if (testPauseRef.current) {
+      // Resume
+      testPauseRef.current = false
+      setTestPaused(false)
+      if (testResumeRef.current) {
+        testResumeRef.current()
+        testResumeRef.current = null
+      }
+    } else {
+      // Pause
+      testPauseRef.current = true
+      setTestPaused(true)
+    }
+  }, [])
+
+  const handleStopTests = useCallback(() => {
+    testAbortRef.current = true
+    testPauseRef.current = false
+    testResumeRef.current = null
+    setIsRunningTests(false)
+    setTestPaused(false)
+    setTestProgress('Stopped')
+  }, [])
+
+  const handleRestartTests = useCallback(() => {
+    testAbortRef.current = true
+    testPauseRef.current = false
+    testResumeRef.current = null
+    setTestPaused(false)
+    // Start fresh after a tick so abort propagates
+    setTimeout(() => handleStartTests(), 100)
+  }, [handleStartTests])
 
   return (
     <div className="app">
@@ -819,18 +876,49 @@ function App() {
         <h2 className="panel-title">Building boundary</h2>
         <p className="panel-hint">Enter latitude and longitude to get the building boundary (Polygon or MultiPolygon). Supports small and large buildings across tiles.</p>
         <div className="panel-inputs">
-          <button
-            type="button"
-            className="btn-get"
-            onClick={handleRunAllTests}
-            disabled={isLoadingBuilding && !isRunningTests}
-            style={{ marginBottom: 8, background: isRunningTests ? '#e53935' : '#ff9800' }}
-          >
-            {isRunningTests ? '⏹ Stop Tests' : '▶ Run All Tests'}
-          </button>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 8 }}>
+            {!isRunningTests ? (
+              <button
+                type="button"
+                className="btn-get"
+                onClick={handleStartTests}
+                disabled={isLoadingBuilding}
+                style={{ flex: 1, background: '#ff9800' }}
+              >
+                ▶ Run All Tests
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className="btn-get"
+                  onClick={handlePauseResume}
+                  style={{ flex: 1, background: testPaused ? '#43a047' : '#fb8c00' }}
+                >
+                  {testPaused ? '▶ Resume' : '⏸ Pause'}
+                </button>
+                <button
+                  type="button"
+                  className="btn-get"
+                  onClick={handleRestartTests}
+                  style={{ flex: 1, background: '#1976d2' }}
+                >
+                  🔄 Restart
+                </button>
+                <button
+                  type="button"
+                  className="btn-get"
+                  onClick={handleStopTests}
+                  style={{ flex: 1, background: '#e53935' }}
+                >
+                  ⏹ Stop
+                </button>
+              </>
+            )}
+          </div>
           {testProgress && (
-            <p style={{ fontSize: 12, margin: '0 0 8px', color: '#555', fontWeight: 500 }}>
-              {testProgress}
+            <p style={{ fontSize: 12, margin: '0 0 8px', color: testPaused ? '#e65100' : '#555', fontWeight: 500 }}>
+              {testPaused ? `⏸ PAUSED — ${testProgress}` : testProgress}
             </p>
           )}
           <label className="input-label">
