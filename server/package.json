@@ -1,0 +1,15 @@
+{
+    "name": "building-boundary-api",
+    "version": "1.0.0",
+    "description": "Headless API for extracting building boundaries using MapTiler/MapLibre + Puppeteer",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node --watch server.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "puppeteer": "^22.0.0",
+        "dotenv": "^16.4.1"
+    }
+}

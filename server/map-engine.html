@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Building Boundary - Headless Engine</title>
+  <style>
+    body { margin: 0; }
+    #map { width: 100vw; height: 100vh; }
+  </style>
+  <!-- MapLibre GL JS -->
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <!-- Turf.js -->
+  <script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script>
+    // ══════════════════════════════════════════════════════════════════════
+    //  Building Boundary Extraction Engine (headless)
+    //  Ported from App.jsx — identical logic, no React dependency
+    // ══════════════════════════════════════════════════════════════════════
+
+    // ── Constants ──
+    const QUERY_RADIUS_PX = 3;
+    const FLY_TO_ZOOM = 17.5;
+    const DISCOVERY_ZOOM = 13.5;
+    const SOURCE_QUERY_DELAY_MS = 75;
+    const AREA_MULTIPLIER = 3.0;
+    const MAX_NEIGHBOR_DISTANCE_KM = 0.05;
+    const MAX_BUILDING_AREA_SQM = 350_000;
+
+    // ── Logging capture (sent back to server.js) ──
+    const _logs = [];
+    function log(msg) {
+      _logs.push(msg);
+      console.log(msg);
+    }
+
+    // ── Helper: ray-casting point-in-ring ──
+    function pointInRing(point, ring) {
+      const [x, y] = point;
+      let inside = false;
+      const n = ring.length;
+      for (let i = 0, j = n - 1; i < n; j = i++) {
+        const [xi, yi] = ring[i];
+        const [xj, yj] = ring[j];
+        if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+      }
+      return inside;
+    }
+
+    // ── Helper: MultiPolygon → single Polygon containing the point ──
+    function toSinglePolygon(feature, lngLat) {
+      if (!feature?.geometry) return null;
+      const { type, coordinates } = feature.geometry;
+      const [lng, lat] = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
+      if (type === 'Polygon') return { type: 'Polygon', coordinates };
+      if (type === 'MultiPolygon') {
+        const point = [lng, lat];
+        for (const polygon of coordinates) {
+          const exteriorRing = polygon[0];
+          if (exteriorRing?.length && pointInRing(point, exteriorRing)) {
+            return { type: 'Polygon', coordinates: polygon };
+          }
+        }
+        return { type: 'Polygon', coordinates: coordinates[0] };
+      }
+      return null;
+    }
+
+    // ── Helper: build GeoJSON Feature ──
+    function buildGeoJSONFromFeature(feature, geometry) {
+      if (!geometry || (geometry.type !== 'Polygon' && geometry.type !== 'MultiPolygon')) return null;
+      return {
+        type: 'Feature',
+        properties: feature.properties || {},
+        geometry
+      };
+    }
+
+    // ── Helper: count coordinate pairs ──
+    function countCoords(geometry) {
+      if (!geometry || !geometry.coordinates) return 0;
+      const c = geometry.coordinates;
+      if (geometry.type === 'Polygon') return (c[0] && c[0].length) || 0;
+      if (geometry.type === 'MultiPolygon')
+        return c.reduce((sum, poly) => sum + ((poly[0] && poly[0].length) || 0), 0);
+      return 0;
+    }
+
+    // ── Helper: extract flat polygon coords list ──
+    function extractPolygonCoords(features) {
+      const coords = [];
+      const turfPolys = [];
+      for (const f of features) {
+        if (!f?.geometry?.coordinates) continue;
+        const { type, coordinates } = f.geometry;
+        if (type === 'Polygon' && coordinates[0]?.length) {
+          try {
+            coords.push(coordinates);
+            turfPolys.push(turf.polygon(coordinates));
+          } catch (_) {
+            coords.push(coordinates);
+            turfPolys.push(null);
+          }
+        } else if (type === 'MultiPolygon' && Array.isArray(coordinates)) {
+          for (const polygonCoords of coordinates) {
+            if (!polygonCoords?.[0]?.length) continue;
+            try {
+              coords.push(polygonCoords);
+              turfPolys.push(turf.polygon(polygonCoords));
+            } catch (_) {
+              coords.push(polygonCoords);
+              turfPolys.push(null);
+            }
+          }
+        }
+      }
+      return { coords, turfPolys };
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  pickOrMergeSourceFeatures — identical to App.jsx
+    // ══════════════════════════════════════════════════════════════════════
+    function pickOrMergeSourceFeatures(features, lngLat, options = {}) {
+      if (!features || features.length === 0) return null;
+      const areaMultiplier = options.areaMultiplier || AREA_MULTIPLIER;
+      const maxDistanceKm = options.maxDistanceKm || MAX_NEIGHBOR_DISTANCE_KM;
+
+      const { coords: allCoords, turfPolys } = extractPolygonCoords(features);
+      if (allCoords.length === 0) return features[0];
+
+      const [lng, lat] = Array.isArray(lngLat) ? lngLat : [lngLat.lng, lngLat.lat];
+      const clickPt = turf.point([lng, lat]);
+
+      if (allCoords.length === 1) {
+        return { ...features[0], geometry: { type: 'Polygon', coordinates: allCoords[0] } };
+      }
+
+      // ── 1) Seed identification ──
+      let seedIndex = -1;
+      let seedArea = Infinity;
+      for (let i = 0; i < allCoords.length; i++) {
+        const poly = turfPolys[i];
+        if (!poly) continue;
+        try {
+          if (turf.booleanPointInPolygon(clickPt, poly)) {
+            const a = turf.area(poly);
+            if (a > MAX_BUILDING_AREA_SQM) continue;
+            if (a < seedArea) {
+              seedArea = a;
+              seedIndex = i;
+            }
+          }
+        } catch (_) { continue; }
+      }
+
+      // Fallback: ray-casting
+      if (seedIndex === -1) {
+        for (let i = 0; i < allCoords.length; i++) {
+          if (allCoords[i]?.[0] && pointInRing([lng, lat], allCoords[i][0])) {
+            seedIndex = i;
+            const poly = turfPolys[i];
+            seedArea = poly ? turf.area(poly) : 0;
+            break;
+          }
+        }
+      }
+
+      // Fallback: closest centroid
+      if (seedIndex === -1) {
+        let minDist = Infinity;
+        for (let i = 0; i < allCoords.length; i++) {
+          const poly = turfPolys[i];
+          if (!poly) continue;
+          try {
+            const d = turf.distance(clickPt, turf.centroid(poly), { units: 'kilometers' });
+            if (d < minDist) {
+              minDist = d;
+              seedIndex = i;
+              seedArea = turf.area(poly);
+            }
+          } catch (_) { continue; }
+        }
+      }
+
+      if (seedIndex === -1) return features[0];
+
+      const seedPoly = turfPolys[seedIndex];
+      const seedCentroid = seedPoly ? turf.centroid(seedPoly) : clickPt;
+      if (!seedArea || seedArea <= 0) seedArea = seedPoly ? turf.area(seedPoly) : 0;
+      const maxClusterArea = seedArea * areaMultiplier;
+
+      const areas = allCoords.map((_, i) => {
+        const p = turfPolys[i];
+        if (!p) return 0;
+        try { return turf.area(p); } catch (_) { return 0; }
+      });
+      const centroids = allCoords.map((_, i) => {
+        const p = turfPolys[i];
+        if (!p) return null;
+        try { return turf.centroid(p); } catch (_) { return null; }
+      });
+
+      // ── 2) Strict expansion ──
+      const cluster = new Set([seedIndex]);
+      let clusterArea = areas[seedIndex] || 0;
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (let i = 0; i < allCoords.length; i++) {
+          if (cluster.has(i)) continue;
+          const poly = turfPolys[i];
+          if (!poly) continue;
+          try {
+            const candidateCentroid = centroids[i];
+            if (candidateCentroid) {
+              const dist = turf.distance(seedCentroid, candidateCentroid, { units: 'kilometers' });
+              if (dist > maxDistanceKm) continue;
+            }
+            const candidateArea = areas[i] || 0;
+            if (maxClusterArea > 0 && (clusterArea + candidateArea) > maxClusterArea) continue;
+            const touchesCluster = [...cluster].some(j => {
+              const other = turfPolys[j];
+              if (!other) return false;
+              try { return turf.booleanIntersects(poly, other); } catch (_) { return false; }
+            });
+            if (!touchesCluster) continue;
+            cluster.add(i);
+            clusterArea += candidateArea;
+            changed = true;
+          } catch (_) { continue; }
+        }
+      }
+
+      // ── 3) Union ──
+      const clusterCoords = [...cluster].map(i => allCoords[i]);
+      if (clusterCoords.length === 0)
+        return { ...features[0], geometry: { type: 'Polygon', coordinates: allCoords[seedIndex] } };
+      if (clusterCoords.length === 1)
+        return { ...features[0], geometry: { type: 'Polygon', coordinates: clusterCoords[0] } };
+
+      let unionResult = null;
+      try {
+        unionResult = turf.polygon(clusterCoords[0]);
+        for (let i = 1; i < clusterCoords.length; i++) {
+          try {
+            const next = turf.polygon(clusterCoords[i]);
+            unionResult = turf.union(turf.featureCollection([unionResult, next]));
+            if (!unionResult) break;
+          } catch (_) { continue; }
+        }
+      } catch (_) { unionResult = null; }
+
+      // ── 4) Force single Polygon ──
+      let finalGeometry = null;
+      if (unionResult?.geometry) {
+        const geom = unionResult.geometry;
+        if (geom.type === 'MultiPolygon' && geom.coordinates.length > 1) {
+          let bestIdx = 0, bestArea = 0;
+          for (let i = 0; i < geom.coordinates.length; i++) {
+            try {
+              const subPoly = turf.polygon(geom.coordinates[i]);
+              if (turf.booleanPointInPolygon(clickPt, subPoly)) { bestIdx = i; break; }
+              const a = turf.area(subPoly);
+              if (a > bestArea) { bestArea = a; bestIdx = i; }
+            } catch (_) { continue; }
+          }
+          finalGeometry = { type: 'Polygon', coordinates: geom.coordinates[bestIdx] };
+        } else if (geom.type === 'MultiPolygon' && geom.coordinates.length === 1) {
+          finalGeometry = { type: 'Polygon', coordinates: geom.coordinates[0] };
+        } else {
+          finalGeometry = geom;
+        }
+      }
+
+      if (!finalGeometry) {
+        finalGeometry = clusterCoords.length === 1
+          ? { type: 'Polygon', coordinates: clusterCoords[0] }
+          : { type: 'MultiPolygon', coordinates: clusterCoords };
+      }
+
+      // ── 5) Cleanup ──
+      try {
+        const cleaned = turf.cleanCoords(turf.feature(finalGeometry));
+        if (cleaned?.geometry) finalGeometry = cleaned.geometry;
+      } catch (_) {}
+
+      return { ...features[0], geometry: finalGeometry };
+    }
+
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  extractBuildingBoundary — the main entry point called by Puppeteer
+    //  Returns: Promise<{ geojson, error, logs }>
+    // ══════════════════════════════════════════════════════════════════════
+    window.extractBuildingBoundary = function (apiKey, latNum, lngNum) {
+      return new Promise((resolve) => {
+        const STYLE_URL = `https://api.maptiler.com/maps/streets-v2/style.json?key=${apiKey}`;
+        const ZOOM_CASCADE = [13.5, 15.5, 17.5, 19.5];
+        const MAX_PASSES = 6;
+        const BBOX_GROWTH = 0.10;
+        const POINT_BUFFER_M = 10;
+
+        _logs.length = 0; // reset logs
+
+        const mapContainer = document.getElementById('map');
+        const map = new maplibregl.Map({
+          container: mapContainer,
+          style: STYLE_URL,
+          center: [lngNum, latNum],
+          zoom: 2,
+        });
+
+        const clickPt = turf.point([lngNum, latNum]);
+
+        // Overall timeout — 120 seconds
+        const timeout = setTimeout(() => {
+          log('[Engine] TIMEOUT after 120s');
+          try { map.remove(); } catch (_) {}
+          resolve({ geojson: null, error: 'Timeout: extraction took too long', logs: [..._logs] });
+        }, 120_000);
+
+        const finish = (geojson, error) => {
+          clearTimeout(timeout);
+          try { map.remove(); } catch (_) {}
+          resolve({ geojson: geojson || null, error: error || null, logs: [..._logs] });
+        };
+
+        // ── Validation: point inside polygon? ──
+        const isPointInsideResult = (geometry) => {
+          if (!geometry) return false;
+          try {
+            const feat = turf.feature(geometry);
+            if (turf.booleanPointInPolygon(clickPt, feat)) return true;
+            const buffered = turf.buffer(feat, POINT_BUFFER_M, { units: 'meters' });
+            if (buffered && turf.booleanPointInPolygon(clickPt, buffered)) return true;
+          } catch (_) {}
+          return false;
+        };
+
+        // ── Discover building at zoom ──
+        const discoverAtZoom = (zoom, onResult) => {
+          log(`── Trying zoom ${zoom} ──`);
+          map.flyTo({ center: [lngNum, latNum], zoom, duration: 400 });
+          map.once('idle', () => {
+            setTimeout(() => {
+              const point = map.project([lngNum, latNum]);
+              const x = point.x ?? point[0];
+              const y = point.y ?? point[1];
+              const bboxPx = [
+                [x - QUERY_RADIUS_PX, y - QUERY_RADIUS_PX],
+                [x + QUERY_RADIUS_PX, y + QUERY_RADIUS_PX]
+              ];
+              const rendered = map.queryRenderedFeatures(bboxPx);
+              const building = rendered.find(
+                (f) =>
+                  f.geometry &&
+                  (f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon') &&
+                  (f.layer?.id?.toLowerCase().includes('building') || f.layer?.type === 'fill')
+              );
+              if (!building) {
+                onResult(null);
+                return;
+              }
+
+              const sourceId = building.source;
+              const sourceLayer = building.sourceLayer;
+              const featureId =
+                building.id ??
+                building.properties?.id ??
+                building.properties?.osm_id;
+
+              let workingFilter = null;
+              if (sourceId && sourceLayer != null && featureId != null) {
+                for (const filter of [
+                  ['==', ['id'], featureId],
+                  ['==', ['get', 'id'], featureId],
+                  ['==', ['get', 'osm_id'], featureId]
+                ]) {
+                  try {
+                    const sf = map.querySourceFeatures(sourceId, { sourceLayer, filter });
+                    if (sf && sf.length > 0) { workingFilter = filter; break; }
+                  } catch (_) { continue; }
+                }
+              }
+
+              if (!workingFilter || !sourceId || sourceLayer == null) {
+                const geom = toSinglePolygon(building, [lngNum, latNum]) || building.geometry;
+                onResult(geom ? { feature: building, geometry: geom } : null);
+                return;
+              }
+
+              // ── Iterative expansion ──
+              let currentMerged = null;
+              let currentGeom = building.geometry;
+              let prevDiagonal = 0;
+              let passNumber = 0;
+
+              try {
+                const sf = map.querySourceFeatures(sourceId, { sourceLayer, filter: workingFilter });
+                if (sf && sf.length > 0) {
+                  const merged = pickOrMergeSourceFeatures(sf, [lngNum, latNum]);
+                  if (merged?.geometry) {
+                    currentMerged = merged;
+                    currentGeom = merged.geometry;
+                  }
+                }
+              } catch (_) {}
+
+              const runPass = () => {
+                passNumber++;
+                if (!currentGeom || passNumber > MAX_PASSES) {
+                  onResult(currentMerged ? { feature: currentMerged, geometry: currentGeom } : null);
+                  return;
+                }
+                const bboxGeo = turf.bbox(turf.feature(currentGeom));
+                const diagonal = turf.distance(
+                  turf.point([bboxGeo[0], bboxGeo[1]]),
+                  turf.point([bboxGeo[2], bboxGeo[3]]),
+                  { units: 'kilometers' }
+                );
+                const growth = prevDiagonal > 0 ? (diagonal - prevDiagonal) / prevDiagonal : 1;
+                if (passNumber > 1 && growth < BBOX_GROWTH) {
+                  log(`z${zoom} pass ${passNumber} — converged`);
+                  onResult(currentMerged ? { feature: currentMerged, geometry: currentGeom } : null);
+                  return;
+                }
+                prevDiagonal = diagonal;
+
+                const adaptiveDistanceKm = Math.max(MAX_NEIGHBOR_DISTANCE_KM, diagonal * 2.0);
+                const adaptiveAreaMultiplier = Math.max(AREA_MULTIPLIER, 10.0);
+
+                log(`z${zoom} pass ${passNumber} — fitBounds (diag=${diagonal.toFixed(3)}km)`);
+                map.fitBounds(
+                  [[bboxGeo[0], bboxGeo[1]], [bboxGeo[2], bboxGeo[3]]],
+                  { padding: 120, maxZoom: FLY_TO_ZOOM, duration: 300 }
+                );
+
+                map.once('idle', () => {
+                  setTimeout(() => {
+                    try {
+                      const features = map.querySourceFeatures(sourceId, { sourceLayer, filter: workingFilter });
+                      if (features && features.length > 0) {
+                        const merged = pickOrMergeSourceFeatures(
+                          features, [lngNum, latNum],
+                          { areaMultiplier: adaptiveAreaMultiplier, maxDistanceKm: adaptiveDistanceKm }
+                        );
+                        if (merged?.geometry) {
+                          currentMerged = merged;
+                          currentGeom = merged.geometry;
+                        }
+                      }
+                    } catch (_) {}
+                    runPass();
+                  }, SOURCE_QUERY_DELAY_MS);
+                });
+              };
+
+              runPass();
+            }, SOURCE_QUERY_DELAY_MS);
+          });
+        };
+
+        // ── Wait for map to load, then start cascading zoom ──
+        map.on('load', () => {
+          log('Map loaded — starting cascading zoom extraction');
+
+          let zoomIndex = 0;
+          let bestResult = null;
+
+          const tryNextZoom = () => {
+            if (zoomIndex >= ZOOM_CASCADE.length) {
+              if (bestResult) {
+                log('All zooms tried — using best available result');
+                finish(buildGeoJSONFromFeature(bestResult.feature, bestResult.geometry), null);
+              } else {
+                finish(null, 'No building found at this location.');
+              }
+              return;
+            }
+            const zoom = ZOOM_CASCADE[zoomIndex];
+            zoomIndex++;
+
+            discoverAtZoom(zoom, (result) => {
+              if (!result || !result.geometry) {
+                log(`z${zoom} — no building found, trying next zoom`);
+                tryNextZoom();
+                return;
+              }
+              bestResult = result;
+
+              const pointOk = isPointInsideResult(result.geometry);
+              let areaOk = true;
+              try { areaOk = turf.area(turf.feature(result.geometry)) <= MAX_BUILDING_AREA_SQM; } catch (_) {}
+
+              if (pointOk && areaOk) {
+                log(`✓ z${zoom} — VALIDATED (point inside + building-sized)`);
+                finish(buildGeoJSONFromFeature(result.feature, result.geometry), null);
+              } else {
+                const reason = !pointOk ? 'point NOT inside' : 'area too large (landuse/zone)';
+                log(`✗ z${zoom} — ${reason}, escalating...`);
+                if (!areaOk) bestResult = null;
+                tryNextZoom();
+              }
+            });
+          };
+
+          tryNextZoom();
+        });
+
+        map.on('error', (e) => {
+          log(`Map error: ${e?.error?.message || 'unknown'}`);
+        });
+      });
+    };
+  </script>
+</body>
+</html>
